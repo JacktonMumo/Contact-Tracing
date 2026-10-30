@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VHF EOC View</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f4f4f5;--bd:#d4d4d8}
+@media(prefers-color-scheme:dark){:root{--bg:#18181b;--fg:#f4f4f5;--card:#27272a;--bd:#3f3f46}}
+body{font:15px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:900px;margin:0 auto;padding:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin:10px 0}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+button{font:inherit;padding:6px 10px;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);cursor:pointer}
+svg{width:100%;height:auto;display:block}
+svg text{fill:var(--fg);font-size:11px}
+.node{cursor:pointer}
+.tag{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;background:var(--bd)}
+ul{margin:6px 0;padding-left:18px}
+.legend span{margin-right:12px;font-size:12px}
+</style></head><body>
+<h2>VHF Epidemiological Command Center</h2>
+<p><em>Synthetic data only. Decision support; a human approves every action.</em></p>
+
+<div class="card">
+  <div class="legend">
+    <span>🔴 index</span><span>🟠 suspected/confirmed case</span><span>🟢 monitored contact</span>
+    <span>🟡 dashed = lost to follow-up</span><span>🔵 ring cohort</span>
+  </div>
+  <div style="overflow-x:auto"><svg id="g" viewBox="0 0 700 340"></svg></div>
+  <p id="hint">Click a node to generate its ring vaccination cohort.</p>
+</div>
+
+<div class="grid">
+  <div class="card"><b>Ring cohort</b>
+    <div id="cohort">Select a node.</div>
+    <p><button onclick="copyCohort()">Copy cohort list</button></p>
+  </div>
+  <div class="card"><b>Lost-to-follow-up watchlist</b> <span class="tag">no visit ≥ 2 days</span>
+    <div id="watch"></div>
+  </div>
+</div>
+
+<div class="card"><b>Ambulance dispatch queue (simulated, from backend)</b>
+  <div id="disp">Loading...</div>
+  <p><button onclick="loadDisp()">Refresh</button></p>
+</div>
+
+<script>
+const API = "http://localhost:8000";
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ---- synthetic data (seen = days since last visit) ----
+const nodes = [
+  {id:"I1", name:"Index I1", type:"index",   hh:"H1", seen:0},
+  {id:"C1", name:"Mary W.",  type:"case",    hh:"H1", seen:0},
+  {id:"C2", name:"John O.",  type:"contact", hh:"H2", seen:0},
+  {id:"C3", name:"Grace A.", type:"contact", hh:"H2", seen:3, loc:"Thika bus stage"},
+  {id:"C4", name:"Peter K.", type:"contact", hh:"H3", seen:0},
+  {id:"C5", name:"Lucy N.",  type:"contact", hh:"H3", seen:1},
+  {id:"C6", name:"Samuel M.",type:"contact", hh:"H4", seen:5, loc:"Nairobi matatu terminus"},
+  {id:"C7", name:"Esther R.",type:"contact", hh:"H4", seen:0},
+];
+const edges = [["I1","C1"],["I1","C2"],["I1","C3"],["C1","C4"],["C1","C5"],["C2","C6"],["C3","C7"]];
+const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+const kids = id => edges.filter(e => e[0] === id).map(e => e[1]);
+const lost = n => n.type === "contact" && n.seen >= 2;
+
+// ---- layout: layer by BFS depth ----
+const depth = {I1: 0};
+for (const q = ["I1"]; q.length;) { const x = q.shift(); kids(x).forEach(k => { if (!(k in depth)) { depth[k] = depth[x] + 1; q.push(k); } }); }
+const maxD = Math.max(...Object.values(depth));
+const layers = {};
+nodes.forEach(n => (layers[depth[n.id]] ||= []).push(n));
+Object.entries(layers).forEach(([d, arr]) => arr.forEach((n, i) => {
+  n.x = 70 + d * (560 / maxD); n.y = (i + 1) * 340 / (arr.length + 1);
+}));
+
+// ---- ring cohort: primary contacts + their contacts and household members ----
+let sel = null, cohort = {primary: [], secondary: []};
+function buildCohort(id) {
+  const primary = kids(id);
+  const sec = new Set();
+  primary.forEach(p => {
+    kids(p).forEach(k => sec.add(k));
+    nodes.filter(n => n.hh === byId[p].hh).forEach(n => sec.add(n.id));
+  });
+  [id, ...primary].forEach(x => sec.delete(x));
+  return {primary, secondary: [...sec]};
+}
+function pick(id) {
+  sel = id; cohort = buildCohort(id);
+  $("hint").textContent = `Selected ${byId[id].name}: ${cohort.primary.length} primary, ${cohort.secondary.length} secondary.`;
+  draw(); renderCohort();
+}
+function renderCohort() {
+  if (!sel) return;
+  const li = ids => ids.map(i => `<li>${esc(byId[i].name)} (${esc(byId[i].hh)})</li>`).join("") || "<li>none</li>";
+  $("cohort").innerHTML = `<b>Primary (${cohort.primary.length})</b><ul>${li(cohort.primary)}</ul>
+    <b>Contacts-of-contacts and household (${cohort.secondary.length})</b><ul>${li(cohort.secondary)}</ul>`;
+}
+function copyCohort() {
+  if (!sel) return;
+  const t = ["id,name,household,ring"]
+    .concat(cohort.primary.map(i => `${i},${byId[i].name},${byId[i].hh},primary`))
+    .concat(cohort.secondary.map(i => `${i},${byId[i].name},${byId[i].hh},secondary`)).join("\n");
+  navigator.clipboard.writeText(t).then(() => $("hint").textContent = "Cohort copied (CSV). Pending clinical approval.");
+}
+
+// ---- draw graph ----
+function draw() {
+  const col = {index: "#dc2626", case: "#ea580c", contact: "#16a34a"};
+  let s = `<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#71717a"/></marker></defs>`;
+  edges.forEach(([a, b]) => {
+    const A = byId[a], B = byId[b];
+    s += `<line x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}" stroke="#71717a" stroke-width="1.5" marker-end="url(#a)"/>`;
+  });
+  nodes.forEach(n => {
+    const inRing = sel && (cohort.primary.includes(n.id) || cohort.secondary.includes(n.id));
+    const stroke = n.id === sel ? "#a855f7" : inRing ? "#2563eb" : lost(n) ? "#eab308" : "#27272a";
+    const w = n.id === sel || inRing || lost(n) ? 4 : 1.5;
+    s += `<g class="node" onclick="pick('${n.id}')"><circle cx="${n.x}" cy="${n.y}" r="17" fill="${col[n.type]}" stroke="${stroke}" stroke-width="${w}" ${lost(n) ? 'stroke-dasharray="4 3"' : ""}/>
+      <text x="${n.x}" y="${n.y + 32}" text-anchor="middle">${esc(n.name)}</text></g>`;
+  });
+  $("g").innerHTML = s;
+}
+
+// ---- watchlist ----
+function renderWatch() {
+  const w = nodes.filter(lost);
+  $("watch").innerHTML = w.length ? "<ul>" + w.map(n =>
+    `<li><b>${esc(n.name)}</b>: ${n.seen} days unseen${n.loc ? ", last known: " + esc(n.loc) : ""} <span class="tag">alert transport hub</span></li>`).join("") + "</ul>"
+    : "None.";
+}
+
+// ---- dispatch queue from backend ----
+async function loadDisp() {
+  try {
+    const r = await fetch(API + "/dispatch", {signal: AbortSignal.timeout(5000)});
+    if (!r.ok) throw 0;
+    const d = await r.json();
+    $("disp").innerHTML = d.length ? "<ul>" + d.map(e =>
+      `<li>${esc(e.contact_id.slice(0, 8))}: ${esc(e.reasons.join("; "))} <span class="tag">${esc(e.time.slice(11, 19))} UTC</span></li>`).join("") + "</ul>" : "No alerts.";
+  } catch { $("disp").textContent = "Backend offline. Start uvicorn to see alerts."; }
+}
+
+draw(); renderWatch(); loadDisp();
+</script></body></html>

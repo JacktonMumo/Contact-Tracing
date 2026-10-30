@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VHF Field View</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f4f4f5;--bd:#d4d4d8}
+@media(prefers-color-scheme:dark){:root{--bg:#18181b;--fg:#f4f4f5;--card:#27272a;--bd:#3f3f46}}
+body{font:15px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:720px;margin:0 auto;padding:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin:10px 0}
+button,input,select,textarea{font:inherit;padding:6px 8px;border-radius:6px;border:1px solid var(--bd);background:var(--bg);color:var(--fg)}
+button{cursor:pointer}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.alert{background:#b91c1c;color:#fff;padding:12px;border-radius:10px;font-weight:600}
+.warn{background:#b45309;color:#fff;padding:8px;border-radius:8px;margin-bottom:6px}
+pre{white-space:pre-wrap;overflow-x:auto}
+textarea{width:100%;box-sizing:border-box}
+</style></head><body>
+<h2>VHF Field View <small id="net"></small></h2>
+<p><em>Synthetic data only. AI extracts notes; triage is rule-based; a human decides.</em></p>
+<div id="alert"></div>
+<div class="card row">
+  <input id="cname" placeholder="Contact name">
+  <input id="clast" type="date" title="Last date of contact">
+  <button onclick="addContact()">Add</button>
+  <button onclick="seed()">Load synthetic</button>
+  <button onclick="sync()">Sync now</button>
+</div>
+<div id="list"></div>
+<div class="card" id="panel" hidden>
+  <b id="pname"></b>
+  <div class="row" style="margin:8px 0">
+    <select id="per"><option>AM</option><option>PM</option></select>
+    <input id="temp" type="number" step="0.1" placeholder="Temp °C">
+  </div>
+  <div class="row">
+    <label><input type="checkbox" class="sym" value="fever"> fever</label>
+    <label><input type="checkbox" class="sym" value="weakness"> weakness</label>
+    <label><input type="checkbox" class="sym" value="muscle pain"> muscle pain</label>
+    <label><input type="checkbox" class="sym" value="vomiting"> vomiting</label>
+    <label><input type="checkbox" class="sym" value="diarrhea"> diarrhea</label>
+    <label><input type="checkbox" class="sym" value="bleeding"> bleeding</label>
+  </div>
+  <p><button onclick="submitVisit()">Save visit</button></p>
+  <textarea id="note" rows="3" placeholder="Dictate or type a visit note..."></textarea>
+  <p><button onclick="extractNote()">Extract with Gemma 4</button></p>
+  <div id="out"></div>
+</div>
+<script>
+const API = "http://localhost:8000";
+const WET = ["vomiting", "diarrhea", "bleeding"];
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let db, cur = null;
+
+// ---- IndexedDB ----
+const openDB = () => new Promise((res, rej) => {
+  const r = indexedDB.open("vhf", 1);
+  r.onupgradeneeded = () => {
+    const d = r.result;
+    d.createObjectStore("contacts", {keyPath: "id"});
+    d.createObjectStore("logs", {autoIncrement: true});
+    d.createObjectStore("queue", {autoIncrement: true});
+  };
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const tx = (s, m, fn) => new Promise((res, rej) => {
+  const t = db.transaction(s, m), q = fn(t.objectStore(s));
+  t.oncomplete = () => res(q && q.result);
+  t.onerror = () => rej(t.error);
+});
+const all = s => tx(s, "readonly", o => o.getAll());
+const put = (s, v) => tx(s, "readwrite", o => o.put(v));
+const add = (s, v) => tx(s, "readwrite", o => o.add(v));
+
+// ---- helpers ----
+const dayOf = l => Math.max(0, Math.min(21, Math.floor((Date.now() - new Date(l + "T00:00:00")) / 864e5)));
+const ring = d => {
+  const C = 125.66;
+  return `<svg width="64" height="64" viewBox="0 0 48 48"><circle cx="24" cy="24" r="20" fill="none" stroke="#a1a1aa55" stroke-width="5"/><circle cx="24" cy="24" r="20" fill="none" stroke="#16a34a" stroke-width="5" stroke-dasharray="${C*d/21} ${C}" transform="rotate(-90 24 24)"/><text x="24" y="28" text-anchor="middle" font-size="12" fill="currentColor">${d}/21</text></svg>`;
+};
+const triageLocal = (t, s) => {
+  const r = [];
+  if (t >= 38.0) r.push("temp " + t + " C");
+  const w = s.filter(x => WET.includes(x));
+  if (w.length) r.push("symptoms: " + w.join(", "));
+  return r;
+};
+async function post(p, b) {
+  const r = await fetch(API + p, {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(b), signal: AbortSignal.timeout(65000)});
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+const iso = n => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
+
+// ---- contacts ----
+async function addContact() {
+  const name = $("cname").value.trim(), last = $("clast").value;
+  if (!name || !last) return alert("Name and last contact date required");
+  await put("contacts", {id: crypto.randomUUID(), name, last, status: "contact"});
+  $("cname").value = ""; render();
+}
+async function seed() {
+  for (const [n, d] of [["Mary W. (synthetic)", 3], ["John O. (synthetic)", 10], ["Grace A. (synthetic)", 18]])
+    await put("contacts", {id: crypto.randomUUID(), name: n, last: iso(d), status: "contact"});
+  render();
+}
+async function render() {
+  const cs = await all("contacts");
+  $("list").innerHTML = cs.map(c => `<div class="card"><div class="row">${ring(dayOf(c.last))}
+    <div style="flex:1"><b>${esc(c.name)}</b><br>Day ${dayOf(c.last)} of 21 · ${c.status === "suspected" ? "⚠ SUSPECTED CASE" : "monitoring"}</div>
+    <button onclick="pick('${c.id}')">Log visit</button></div></div>`).join("") || "<p>No contacts yet.</p>";
+}
+async function pick(id) {
+  cur = id;
+  const c = (await all("contacts")).find(x => x.id === id);
+  $("pname").textContent = c.name; $("panel").hidden = false; $("out").innerHTML = "";
+  $("panel").scrollIntoView();
+}
+
+// ---- visit + triage (rule-based, works offline) ----
+async function submitVisit() {
+  const c = (await all("contacts")).find(x => x.id === cur);
+  const t = parseFloat($("temp").value);
+  if (isNaN(t) || t < 30 || t > 45) return alert("Enter a valid temperature (30-45 C)");
+  const s = [...document.querySelectorAll(".sym:checked")].map(x => x.value);
+  await add("logs", {kind: "visit", contact: cur, period: $("per").value, temp: t, symptoms: s, t: Date.now()});
+  const r = triageLocal(t, s);
+  if (r.length) {
+    c.status = "suspected"; await put("contacts", c);
+    $("alert").innerHTML = `<div class="alert">STOP INTERVIEW. ${esc(c.name)}: ${esc(r.join("; "))}.<br>Keep at least 1 m distance. Ambulance alert ${navigator.onLine ? "sent" : "queued (offline)"} (simulated).</div>`;
+    const body = {contact_id: c.id, temp_c: t, symptoms: s};
+    try { await post("/triage", body); } catch { await add("queue", {type: "triage", body}); }
+  } else $("alert").innerHTML = "";
+  render();
+}
+
+// ---- Gemma extraction (queued if offline) ----
+const showOut = r => $("out").innerHTML = (r.needs_review ? '<div class="warn">Needs human review</div>' : "") + "<pre>" + esc(JSON.stringify(r, null, 2)) + "</pre>";
+async function extractNote() {
+  const text = $("note").value.trim();
+  if (text.length < 3) return;
+  $("out").textContent = "Extracting...";
+  try {
+    const r = await post("/extract", {text});
+    await add("logs", {kind: "extraction", contact: cur, result: r, t: Date.now()});
+    showOut(r);
+  } catch {
+    await add("queue", {type: "note", contact: cur, body: {text}});
+    $("out").textContent = "Offline or AI unavailable: note queued, will extract on sync.";
+  }
+}
+
+// ---- background sync ----
+async function sync() {
+  const q = await all("queue");
+  if (!q.length) return;
+  await tx("queue", "readwrite", o => o.clear());
+  for (const it of q) {
+    try {
+      const r = await post(it.type === "triage" ? "/triage" : "/extract", it.body);
+      if (it.type === "note") await add("logs", {kind: "extraction", contact: it.contact, result: r, t: Date.now()});
+    } catch { await add("queue", it); }
+  }
+  render();
+}
+const net = () => $("net").textContent = navigator.onLine ? "● online" : "○ offline";
+addEventListener("online", () => { net(); sync(); });
+addEventListener("offline", net);
+(async () => { db = await openDB(); net(); render(); sync(); })();
+</script></body></html>
